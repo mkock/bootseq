@@ -1,4 +1,8 @@
-# bootseq&nbsp;[![GoDoc](https://godoc.org/github.com/mkock/bootseq?status.svg)](https://godoc.org/github.com/mkock/bootseq)
+# bootseq
+
+[![GoDoc](https://godoc.org/github.com/mkock/bootseq?status.svg)](https://godoc.org/github.com/mkock/bootseq)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GoReportCard](https://goreportcard.com/badge/github.com/mkock/bootseq)](https://goreportcard.com/report/github.com/mkock/bootseq)
 
 Package bootseq provides a general-purpose boot sequence manager with separate
 startup/shutdown phases, cancellation and a simple abstraction that allows easy
