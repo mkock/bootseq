@@ -1,4 +1,4 @@
-module github.com/mkock/bootseq
+module github.com/mkock/bootseq/v2
 
 go 1.13
 
