@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -359,28 +360,23 @@ func TestAgent(t *testing.T) {
 	mgr.Register("two", NoOp, NoOp)
 	mgr.Register("three", NoOp, NoOp)
 
+	updater1 := newIndexUpdater(4)
+	updater2 := newIndexUpdater(5)
+
 	// First agent.
 	agent, err := mgr.Agent()
 	verifyNilErr(t, err)
-	err = agent.Up(context.Background())
+	err = agent.Up(context.Background(), updater1.progress())
 	verifyNilErr(t, err)
-
-	p, err := agent.Progress()
-	verifyNilErr(t, err)
-	names := progressChannelAsStrings(p)
-	_ = verifyStringsEqual(t, []string{"one", "two", "three", ""}, names)
+	verifyStringsEqual(t, []string{"one", "two", "three", ""}, updater1.actual)
 
 	// Second agent.
 	mgr.Register("four", NoOp, NoOp)
 	agent, err = mgr.Agent()
 	verifyNilErr(t, err)
-	err = agent.Up(context.Background())
+	err = agent.Up(context.Background(), updater2.progress())
 	verifyNilErr(t, err)
-
-	p, err = agent.Progress()
-	verifyNilErr(t, err)
-	names = progressChannelAsStrings(p)
-	_ = verifyStringsEqual(t, []string{"one", "two", "three", "four", ""}, names)
+	verifyStringsEqual(t, []string{"one", "two", "three", "four", ""}, updater2.actual)
 }
 
 func TestAgentServiceCount(t *testing.T) {
@@ -407,22 +403,6 @@ func TestAgentServiceCount(t *testing.T) {
 }
 
 func TestAgentUp(t *testing.T) {
-	t.Run("it returns a channel with capacity that equals service count plus 1", func(t *testing.T) {
-		mgr := New("Three-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		mgr.Register("two", NoOp, NoOp)
-		mgr.Register("three", NoOp, NoOp)
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		verifyChannelCap(t, p, 4)
-	})
-
 	t.Run("it runs all services", func(t *testing.T) {
 		mgr := New("Three-service boot sequence")
 		mgr.Register("one", NoOp, NoOp)
@@ -431,14 +411,10 @@ func TestAgentUp(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
+		updater := newIndexUpdater(4)
+		err = agent.Up(context.Background(), updater.progress())
 		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-		names := progressChannelAsStrings(p)
-
-		_ = verifyStringsEqual(t, []string{"one", "two", "three", ""}, names)
+		verifyStringsEqual(t, []string{"one", "two", "three", ""}, updater.actual)
 	})
 
 	t.Run("it runs dependent services in chronological order", func(t *testing.T) {
@@ -449,17 +425,11 @@ func TestAgentUp(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
+		updater := newIndexUpdater(4)
+		err = agent.Up(context.Background(), updater.progress())
 		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"one", "two", "three", ""}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
+		orderPreserved := verifyStringsEqual(t, []string{"one", "two", "three", ""}, updater.actual)
+		verifyOrderPreserved(t, orderPreserved)
 	})
 
 	t.Run("it runs services in chronological order (advanced case)", func(t *testing.T) {
@@ -473,65 +443,49 @@ func TestAgentUp(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"one", "two", "three", "four", errService.Error()}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
+		updater := newIndexUpdater(7)
+
+		err = agent.Up(context.Background(), updater.progress())
+		verifyErrorType(t, err, errService)
+		orderPreserved := verifyStringsEqual(t, []string{"one", "two", "three", "four", "five"}, updater.actual)
+		verifyOrderPreserved(t, orderPreserved)
 	})
 
 	t.Run("it fails if called while booting up", func(t *testing.T) {
 		mgr := New("Three-service boot sequence")
 		mgr.Register("one", SleepOp, NoOp)
-		mgr.Register("two", SleepOp, NoOp)
-		mgr.Register("three", SleepOp, NoOp)
+		mgr.Register("two", SleepOp, NoOp).After("one")
+		mgr.Register("three", SleepOp, NoOp).After("two")
+		mgr.Register("four", SleepOp, NoOp).After("three")
+		mgr.Register("five", SleepOp, NoOp).After("four")
+		mgr.Register("six", SleepOp, NoOp).After("five")
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
+		var (
+			err1, err2 error
+			wg         sync.WaitGroup
+		)
 
-		err = agent.Up(context.Background())
-		verifyErrorType(t, err, InvalidStateError(inProgressErrorMessage))
+		wg.Add(2)
+		go func() {
+			err1 = agent.Up(context.Background(), nil)
+			wg.Done()
+		}()
+
+		go func() {
+			err2 = agent.Up(context.Background(), nil)
+			wg.Done()
+		}()
+
+		wg.Wait()
+		if err1 == nil && err2 == nil {
+			t.Error("expected err1 or err2 to be non-nil")
+		}
 	})
 }
 
 func TestAgentDown(t *testing.T) {
-	t.Run("returns channel with capacity matching service count", func(t *testing.T) {
-		mgr := New("Three-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		mgr.Register("two", NoOp, NoOp)
-		mgr.Register("three", NoOp, NoOp)
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-		verifyChannelCap(t, p, 4)
-		<-p
-		<-p
-		<-p
-		<-p
-
-		err = agent.Down(context.Background())
-		verifyNilErr(t, err)
-
-		p, err = agent.Progress()
-		verifyNilErr(t, err)
-
-		verifyChannelCap(t, p, 4)
-		<-p
-		<-p
-		<-p
-		<-p
-	})
-
 	t.Run("it runs all services", func(t *testing.T) {
 		mgr := New("Three-service boot sequence")
 		mgr.Register("one", NoOp, NoOp)
@@ -540,23 +494,14 @@ func TestAgentDown(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
+		updater1 := newIndexUpdater(4)
+		err = agent.Up(context.Background(), updater1.progress())
 		verifyNilErr(t, err)
 
-		p, err := agent.Progress()
+		updater2 := newIndexUpdater(4)
+		err = agent.Down(context.Background(), updater2.progress())
 		verifyNilErr(t, err)
-		<-p
-		<-p
-		<-p
-		<-p
-
-		err = agent.Down(context.Background())
-		verifyNilErr(t, err)
-		p, err = agent.Progress()
-		verifyNilErr(t, err)
-		names := progressChannelAsStrings(p)
-
-		_ = verifyStringsEqual(t, []string{"one", "two", "three", ""}, names)
+		verifyStringsEqual(t, []string{"one", "two", "three", ""}, updater2.actual)
 	})
 
 	t.Run("it runs services in reverse chronological order", func(t *testing.T) {
@@ -567,26 +512,15 @@ func TestAgentDown(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-		<-p
-		<-p
-		<-p
-		<-p
-
-		err = agent.Down(context.Background())
+		updater1 := newIndexUpdater(4)
+		err = agent.Up(context.Background(), updater1.progress())
 		verifyNilErr(t, err)
 
-		p, err = agent.Progress()
+		updater2 := newIndexUpdater(4)
+		err = agent.Down(context.Background(), updater2.progress())
 		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"three", "two", "one", ""}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
+		orderPreserved := verifyStringsEqual(t, []string{"three", "two", "one", ""}, updater2.actual)
+		verifyOrderPreserved(t, orderPreserved)
 	})
 
 	t.Run("it runs services in reverse order (advanced case)", func(t *testing.T) {
@@ -600,28 +534,15 @@ func TestAgentDown(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-		<-p
-		<-p
-		<-p
-		<-p
-		<-p
-		<-p
-		<-p
-
-		err = agent.Down(context.Background())
-		verifyNilErr(t, err)
-		p, err = agent.Progress()
+		updater1 := newIndexUpdater(7)
+		err = agent.Up(context.Background(), updater1.progress())
 		verifyNilErr(t, err)
 
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"six", "five", "four", "three", errService.Error()}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
+		updater2 := newIndexUpdater(7)
+		err = agent.Down(context.Background(), updater2.progress())
+		verifyErrorType(t, err, errService)
+		orderPreserved := verifyStringsEqual(t, []string{"six", "five", "four", "three", "two"}, updater2.actual)
+		verifyOrderPreserved(t, orderPreserved)
 	})
 
 	t.Run("it fails if called while booting up", func(t *testing.T) {
@@ -632,35 +553,27 @@ func TestAgentDown(t *testing.T) {
 		agent, err := mgr.Agent()
 		verifyNilErr(t, err)
 
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
+		var (
+			err1, err2 error
+			wg         sync.WaitGroup
+		)
 
-		err = agent.Down(context.Background())
-		verifyErrorType(t, err, InvalidStateError(upErrorMessage))
+		wg.Add(2)
+		func() {
+			err1 = agent.Up(context.Background(), nil)
+			wg.Done()
+		}()
+
+		func() {
+			err2 = agent.Up(context.Background(), nil)
+			wg.Done()
+		}()
+
+		wg.Wait()
+		if err1 == nil && err2 == nil {
+			t.Error("expected err1 or err2 to be non-nil")
+		}
 	})
-}
-
-func TestAgentUpDown(t *testing.T) {
-	updater := newIndexUpdater(6) // One for each Service Func.
-
-	mgr := New("Three-service boot sequence")
-	mgr.Register("one", updater.index(0), updater.index(1))
-	mgr.Register("two", updater.index(2), updater.index(3))
-	mgr.Register("three", updater.index(4), updater.index(5))
-	agent, err := mgr.Agent()
-	verifyNilErr(t, err)
-
-	err = agent.Up(context.Background())
-	verifyNilErr(t, err)
-	err = agent.Wait()
-	verifyNilErr(t, err)
-
-	err = agent.Down(context.Background())
-	verifyNilErr(t, err)
-	err = agent.Wait()
-	verifyNilErr(t, err)
-
-	verifyIndexUpdater(t, updater)
 }
 
 func TestAgentCancel(t *testing.T) {
@@ -676,18 +589,22 @@ func TestAgentCancel(t *testing.T) {
 		verifyNilErr(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
-		err = agent.Up(ctx)
-		verifyNilErr(t, err)
+		updater := newIndexUpdater(7)
 
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			err = agent.Up(ctx, updater.progress())
+			verifyErrorType(t, err, context.Canceled)
+			wg.Done()
+		}()
 		cancel()
 
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		for p := range p {
-			if p.Service == "five" {
+		wg.Wait()
+		for _, a := range updater.actual {
+			if a == "five" {
 				// Execution should stop long before reaching the fifth service.
-				t.Fatal("did not expect to encounter service five due to cancellation")
+				t.Error("did not expect to encounter service five due to cancellation")
 			}
 		}
 	})
@@ -707,14 +624,12 @@ func TestAgentTimeout(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
-		err = agent.Up(ctx)
-		verifyNilErr(t, err)
+		updater := newIndexUpdater(7)
+		err = agent.Up(ctx, updater.progress())
+		verifyErrorType(t, err, context.DeadlineExceeded)
 
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		for p := range p {
-			if p.Service == "five" {
+		for _, a := range updater.actual {
+			if a == "five" {
 				// Execution should stop long before reaching the fifth service.
 				t.Fatal("did not expect to encounter service five due to cancellation")
 			}
@@ -840,168 +755,5 @@ func TestAgentString(t *testing.T) {
 		actual := agent.String()
 		expected := "(one : two) > (four : nine : ten : three) > (five) > (eight : seven : six)"
 		verifyStringEquals(t, expected, actual)
-	})
-}
-
-func TestAgentErrors(t *testing.T) {
-	t.Run("returns an error when Agent.Wait() is called after Agent.Progress()", func(t *testing.T) {
-		mgr := New("Single-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		_, err = agent.Progress()
-		verifyNilErr(t, err)
-
-		err = agent.Wait()
-		verifyErrorType(t, err, CalleeError(calleeErrorMessage))
-	})
-
-	t.Run("returns an error when Agent.Progress() is called after Agent.Wait()", func(t *testing.T) {
-		mgr := New("Single-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		err = agent.Wait()
-		verifyNilErr(t, err)
-
-		_, err = agent.Progress()
-		verifyErrorType(t, err, CalleeError(calleeErrorMessage))
-	})
-}
-
-func TestProgress(t *testing.T) {
-	t.Run("returns one Progress report per service (base case)", func(t *testing.T) {
-		mgr := New("One-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"one", ""}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
-	})
-
-	t.Run("returns one Progress report per service (simple case)", func(t *testing.T) {
-		mgr := New("Three-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		mgr.Register("two", NoOp, NoOp).After("one")
-		mgr.Register("three", NoOp, NoOp).After("two")
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		orderPreserved := verifyStringsEqual(t, []string{"one", "two", "three", ""}, names)
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
-	})
-
-	t.Run("returns one Progress report per service (advanced case)", func(t *testing.T) {
-		mgr := New("Three-service boot sequence")
-		mgr.Register("one", NoOp, NoOp)
-		mgr.Register("two", NoOp, NoOp).After("one")
-		mgr.Register("three", NoOp, NoOp).After("two")
-		mgr.Register("four", NoOp, NoOp).After("two")
-		mgr.Register("five", NoOp, NoOp).After("two")
-		mgr.Register("six", NoOp, NoOp).After("five")
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		if len(names) != 7 {
-			t.Fatalf("expected to receive %d progress reports, got %d", 7, len(names))
-		}
-
-		_ = verifyStringsEqual(t, []string{"one"}, names[:1])
-		_ = verifyStringsEqual(t, []string{"two"}, names[1:2])
-		_ = verifyStringsEqual(t, []string{"three", "four", "five"}, names[2:5])
-		_ = verifyStringsEqual(t, []string{"six"}, names[5:6])
-		_ = verifyStringsEqual(t, []string{""}, names[6:])
-	})
-
-	t.Run("returns one Progress report per service (very advanced case)", func(t *testing.T) {
-		mgr := New("Three-service boot sequence")
-		mgr.Register("one", NoOp, NoOp).After("seven")
-		mgr.Register("two", NoOp, NoOp).After("seven")
-		mgr.Register("three", NoOp, NoOp).After("eight")
-		mgr.Register("four", NoOp, NoOp).After("eight")
-		mgr.Register("five", NoOp, NoOp).After("four")
-		mgr.Register("six", NoOp, NoOp).After("five")
-		mgr.Register("seven", NoOp, NoOp)
-		mgr.Register("eight", NoOp, NoOp)
-		mgr.Register("nine", NoOp, NoOp).After("six")
-		mgr.Register("ten", NoOp, NoOp).After("six")
-		mgr.Register("eleven", NoOp, NoOp).After("nine")
-		mgr.Register("twelve", NoOp, NoOp).After("ten")
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		if len(names) != 13 {
-			t.Fatalf("expected to receive %d progress reports, got %d", 13, len(names))
-		}
-
-		_ = verifyStringsEqual(t, []string{"seven", "eight"}, names[:2])
-		_ = verifyStringsEqual(t, []string{"one", "two", "three", "four"}, names[2:6])
-		orderPreserved := verifyStringsEqual(t, []string{"five", "six"}, names[6:8])
-		if !orderPreserved {
-			t.Fatal("services were not executed in correct order")
-		}
-		_ = verifyStringsEqual(t, []string{"nine", "ten"}, names[8:10])
-		_ = verifyStringsEqual(t, []string{"eleven", "twelve"}, names[10:12])
-		_ = verifyStringsEqual(t, []string{""}, names[12:])
-	})
-
-	t.Run("returns one Progress report per service up until a service error", func(t *testing.T) {
-		mgr := New("Boot it!")
-		mgr.Register("one", NoOp, NoOp)
-		mgr.Register("two", NoOp, NoOp).After("one")
-		mgr.Register("three", ErrOp, ErrOp).After("two")
-		mgr.Register("four", NoOp, NoOp).After("three")
-		agent, err := mgr.Agent()
-		verifyNilErr(t, err)
-
-		err = agent.Up(context.Background())
-		verifyNilErr(t, err)
-
-		p, err := agent.Progress()
-		verifyNilErr(t, err)
-
-		names := progressChannelAsStrings(p)
-		verifyStringsEqual(t, []string{"one", "two", errService.Error()}, names)
 	})
 }

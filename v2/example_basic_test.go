@@ -3,11 +3,11 @@ package bootseq_test
 import (
 	"context"
 	"fmt"
-	"github.com/mkock/bootseq"
+	"github.com/mkock/bootseq/v2"
 	"strings"
 )
 
-func Example_basic() {
+func Example_basic_test() {
 	// Let's use a boot sequence to construct a sentence!
 	// For the shutdown sequence, we'll "deconstruct" it by removing each word.
 	var words []string
@@ -32,18 +32,23 @@ func Example_basic() {
 	agent, _ := seq.Agent()
 
 	// Startup sequence.
-	_ = agent.Up(context.Background())
-	_ = agent.Wait()
-
+	_ = agent.Up(context.Background(), func(p bootseq.Progress) { fmt.Println(p.Service) })
 	fmt.Println(strings.Join(words, " "))
 
 	// Shutdown sequence.
-	_ = agent.Down(context.Background())
-	_ = agent.Wait()
-
+	_ = agent.Down(context.Background(), func(p bootseq.Progress) { fmt.Println(p.Service) })
 	fmt.Println(strings.Join(words, " "))
 
 	// Output:
+	// welcome
+	// to
+	// my
+	// world
+	//
 	// Welcome to my world!
+	// world
+	// my
+	// to
+	// welcome
 	//
 }

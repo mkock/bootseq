@@ -26,13 +26,11 @@ sequence.Register("some-service", someServiceUp, someServiceDown)
 sequence.Register("other-service", otherServiceUp, otherServiceDown)
 sequence.Register("third-service", thirdServiceUp, thirdServiceDown).After("other-service")
 agent, err := sequence.Agent()
-up := agent.Up(context.Background())
-up.Wait()
-
+err = agent.Up(context.Background(), nil)
 // Your application is now ready!
 
-down := agent.Down(context.Background())
-down.Wait()
+err = agent.Down(context.Background(), nil)
+// Your application has now been shut down!
 ```
 
 ## Preamble
@@ -70,34 +68,27 @@ the boot sequence, you can register them in the `init` functions of the respecti
 
 ### Progress reports
 
-Once a boot sequence is in progress, you may call either `Agent.Wait()` or
-`Agent.Progress()` on the agent. You'll get an error if you call both.
+When calling `Agent.Up()` or `Agent.Down()`, provide a function callback as the second argument in order to receive
+progress reports during execution. The callback is called every time a `Service` operation has completed, and once more
+when the entire boot sequence has completed. For boot sequences with _n_ `Services`, the callback would get called
+_n+1_ times. If one of the `Services` return an error, execution stops at that point and no further calls are made to
+the callback.
 
-`Agent.Wait()` will block while the boot sequence is running. It returns when the sequence has completed, or if
-an error was raised during execution.
+The callback function must have this signature: `func(Progress)`. `Progress` is a simple struct:
 
-`Agent.Progress()`, on the other hand, will return a channel of `Progress` structs. You can then iterate over
-each `Progress` struct to receive progress updates as they occur. Although these progress reports don't tell you how
-far you are in the boot sequence, you can easily devise your own progress indicator by getting the total number of
-services from `Manager.ServiceCount()` combined with a counter that is incremented by one for every _Progress_
-report received. _Progress_ reports also serve as error handlers.
-
-_Progress_ reports are simple structs containing the name of the executed service
-and an error (which is nil for successful execution):
-
-```go
-type Progress struct {
-	Service string
-	Err     error
+```
+struct Progress {
+    Service string
+    Err     error
 }
 ```
+
+It keeps the name of the executed `Service` and an error (which may be nil). The final `Progress` received which marks
+the end of the boot sequence, always contain an empty `Service` name, ie. an empty string.
 
 Due to the fact that execution steps may be cancelled or time out due to their associated context, the reported
 error can be of type `context.Canceled` or `context.DeadlineExceeded`. It can also be of any type returned by your
 _Service_ functions.
-
-Note: you will receive exactly one _Progress_ report per registered _Service_, plus one extra that indicates the end
-of the boot sequence. The last _Progress_ report will always have an empty _Service_ name.
 
 ### Cancellation and Errors
 
@@ -123,8 +114,7 @@ A panic is raised if any of these limitations are breached.
 ## Feature Wish List
 
 - Optional injection of logger after instantiation
-- Proper shutdown on panics and timeouts
-- Method for unregistering services
+- Log execution times for individual services
 
 ## FAQ
 

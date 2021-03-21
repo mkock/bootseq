@@ -3,31 +3,27 @@ package bootseq
 import (
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
 
-type indexUpdater []bool
+type indexUpdater struct {
+	lock   sync.Mutex
+	actual []string
+}
 
 func newIndexUpdater(capacity int) *indexUpdater {
-	u := make(indexUpdater, capacity)
+	u := indexUpdater{}
+	u.actual = make([]string, 0, capacity)
 	return &u
 }
 
-func (i *indexUpdater) index(j int) func() error {
-	return func() error {
-		(*i)[j] = true
-		return nil
-	}
-}
-
-func verifyIndexUpdater(t *testing.T, i *indexUpdater) {
-	t.Helper()
-
-	for j, value := range *i {
-		if !value {
-			t.Fatalf("expected index %d to be true", j)
-		}
+func (i *indexUpdater) progress() func(Progress) {
+	i.lock.Lock()
+	defer i.lock.Unlock()
+	return func(p Progress) {
+		i.actual = append(i.actual, p.Service)
 	}
 }
 
@@ -58,18 +54,6 @@ func verifyNilErr(t *testing.T, err error) {
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
-}
-
-func progressChannelAsStrings(pChan chan Progress) []string {
-	names := make([]string, 0)
-	for p := range pChan {
-		msg := p.Service
-		if p.Err != nil {
-			msg = p.Err.Error()
-		}
-		names = append(names, msg)
-	}
-	return names
 }
 
 func verifyErrorType(t *testing.T, actual, expected error) {
@@ -119,6 +103,12 @@ func verifyStringsEqual(t *testing.T, expected, actual []string) bool {
 	return isOrderPreserved
 }
 
+func verifyOrderPreserved(t *testing.T, res bool) {
+	if !res {
+		t.Error("expected order to have been preserved")
+	}
+}
+
 func verifyCountEq(t *testing.T, c uint32, expected uint32) {
 	t.Helper()
 
@@ -140,15 +130,6 @@ func verifyPanicWithMsg(t *testing.T, expected string) {
 	}
 	if actual != expected {
 		t.Fatalf("expected panic message to equal %q, got %q", expected, actual)
-	}
-}
-
-func verifyChannelCap(t *testing.T, ch chan Progress, capacity int) {
-	t.Helper()
-
-	actualCap := cap(ch)
-	if actualCap != capacity {
-		t.Fatalf("expected channel with capacity %d, got %d", capacity, actualCap)
 	}
 }
 

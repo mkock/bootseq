@@ -10,16 +10,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// calleeDef keeps track of how the callee decided to wait for the sequence to finish. Possible values: calleeNone
-// (undefined), calleeWait (Agent.Wait() was called) and calleeProg (Agent.Progress() was called).
-type calleeDef uint8
-
-const (
-	calleeNone calleeDef = iota
-	calleeWait
-	calleeProg
-)
-
 // state represents a Manager's state. It's either:
 // 1. doing nothing (stateIdle),
 // 2. in the startup sequence (stateUp),
@@ -82,9 +72,9 @@ type orderedServices map[uint16][]Service
 // Manager provides registration and storage of boot sequence Services.
 // Manager can instantiate an Agent, which is responsible for running the actual startup and shutdown sequences.
 type Manager struct {
-	sync.Mutex // Protects field services.
+	name string
 
-	name     string
+	lock     sync.Mutex // Protects field services.
 	services unorderedServices
 }
 
@@ -93,13 +83,13 @@ type Manager struct {
 // which the sequence is executed.
 // Each Agent keeps track of its progress and handles execution of sequence Services.
 type Agent struct {
-	sync.Mutex             // Controls access to Agent.callee.
-	name            string // Name of boot sequence.
-	state           state  // Current state: up/down.
-	orderedServices orderedServices
-	callee          calleeDef     // Did client call Wait/Progress?
-	isDone          bool          // Did sequence execution complete?
-	progress        chan Progress // Progress reporting.
+	name            string          // Name of boot sequence.
+	progressFn      func(Progress)  // Progress reporting.
+	orderedServices orderedServices // Map of Service priorities, with each  containing a slice of services.
+
+	lock   sync.Mutex // Controls access to the fields below it.
+	state  state      // Current state: up/down.
+	isDone bool       // Did sequence execution complete?
 }
 
 // setPriority looks up the Service with the given name and attempts to set its priority.
@@ -163,7 +153,7 @@ func (o orderedServices) length() int {
 // New returns a new and uninitialised boot sequence Manager.
 func New(name string) *Manager {
 	services := make(map[string]*Service)
-	mgr := Manager{sync.Mutex{}, name, services}
+	mgr := Manager{lock: sync.Mutex{}, name: name, services: services}
 	return &mgr
 }
 
@@ -171,8 +161,8 @@ func New(name string) *Manager {
 // Service with the given name already exists, the provided up- and down functions replace those already registered. Add
 // returns a pointer to the added Service, that you can call After() on, in order to influence order of execution.
 func (m *Manager) Register(name string, up, down Func) *Service {
-	m.Lock()
-	defer m.Unlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	if len(m.services) == 65535 {
 		panic(panicServiceLimit)
@@ -186,8 +176,8 @@ func (m *Manager) Register(name string, up, down Func) *Service {
 // ServiceCount returns the number of services currently registered with the
 // Manager.
 func (m *Manager) ServiceCount() uint16 {
-	m.Lock()
-	defer m.Unlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	return uint16(len(m.services))
 }
@@ -195,8 +185,8 @@ func (m *Manager) ServiceCount() uint16 {
 // ServiceNames returns the name of each registered service, in no
 // particular order.
 func (m *Manager) ServiceNames() []string {
-	m.Lock()
-	defer m.Unlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	ns := make([]string, 0, len(m.services))
 
@@ -210,12 +200,12 @@ func (m *Manager) ServiceNames() []string {
 // Agent orders the registered services by priority and returns an Agent for controlling the startup and shutdown
 // sequences. Agent returns an error if any of the registered Services refer to other Services that are not registered.
 func (m *Manager) Agent() (agent *Agent, err error) {
-	m.Lock()
+	m.lock.Lock()
 	if len(m.services) == 0 {
 		err = EmptySequenceError(m.name)
 		return
 	}
-	m.Unlock()
+	m.lock.Unlock()
 	if err = m.Validate(); err != nil {
 		return
 	}
@@ -228,8 +218,8 @@ func (m *Manager) Agent() (agent *Agent, err error) {
 // Validate cycles through each registered service and checks if they refer to other service names that don't exist,
 // or if they refer to themselves. Validate returns an error if this is the case, or nil otherwise.
 func (m *Manager) Validate() error {
-	m.Lock()
-	defer m.Unlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	if len(m.services) == 0 {
 		return EmptySequenceError(m.name)
@@ -260,9 +250,6 @@ func (m *Manager) Validate() error {
 
 // ServiceCount returns the number of services currently registered with the Agent.
 func (a *Agent) ServiceCount() uint16 {
-	a.Lock()
-	defer a.Unlock()
-
 	return uint16(a.orderedServices.length())
 }
 
@@ -271,9 +258,6 @@ func (a *Agent) ServiceCount() uint16 {
 // other services, and a right-arrow when it will run before another service.
 // Services that have the same priority are sorted alphabetically for reasons of reproducibility.
 func (a *Agent) String() string {
-	a.Lock()
-	defer a.Unlock()
-
 	var sequence strings.Builder
 
 	for i := uint16(1); i <= uint16(len(a.orderedServices)); i++ {
@@ -291,71 +275,31 @@ func (a *Agent) String() string {
 	return ret[:len(ret)-3]
 }
 
-// Progress allows the caller to receive progress reports over a channel.
-// Progress returns a channel that will receive a Progress struct every time a Service in the boot sequence has
-// completed. In case of an error, execution will stop and no further progress reports will be sent. Consequently, there
-// will either be a progress report for each Service in the sequence (plus one more to mark the end of execution), or
-// if execution stops short, the last progress report sent will contain an error.
-func (a *Agent) Progress() (chan Progress, error) {
-	a.Lock()
-	if a.callee == calleeWait {
-		a.Unlock()
-		return nil, CalleeError(calleeErrorMessage)
-	}
-	a.callee = calleeProg
-	a.Unlock()
-
-	return a.progress, nil
-}
-
-// Wait will block until execution of the boot sequence has completed.
-// It returns an error if any Services in the sequence failed.
-func (a *Agent) Wait() error {
-	a.Lock()
-	if a.callee == calleeProg {
-		a.Unlock()
-		return CalleeError(calleeErrorMessage)
-	}
-	a.callee = calleeWait
-	a.Unlock()
-
-	for p := range a.progress {
-		if p.Err != nil {
-			return p.Err
-		}
-	}
-
-	return nil
-}
-
 // Up runs the startup sequence.
 // Up returns an error if the Agent's current state doesn't allow the sequence to start.
-func (a *Agent) Up(ctx context.Context) error {
-	a.Lock()
-	defer a.Unlock()
-
+func (a *Agent) Up(ctx context.Context, progressFn func(Progress)) error {
+	a.lock.Lock()
 	if a.state != stateIdle {
 		msg := inProgressErrorMessage
 		if a.state == stateDown {
 			msg = doneErrorMessage
 		}
+		a.lock.Unlock()
 		return InvalidStateError(msg)
 	}
 
 	a.state = stateUp
 	a.isDone = false
-	a.progress = make(chan Progress, a.orderedServices.length()+1)
+	a.progressFn = progressFn
+	a.lock.Unlock()
 
-	go a.exec(ctx)
-	return nil
+	return a.exec(ctx)
 }
 
 // Down runs the shutdown sequence.
 // Down returns an error if the Agent's current state doesn't allow the sequence to start.
-func (a *Agent) Down(ctx context.Context) error {
-	a.Lock()
-	defer a.Unlock()
-
+func (a *Agent) Down(ctx context.Context, progressFn func(Progress)) error {
+	a.lock.Lock()
 	if a.state != stateUp || !a.isDone {
 		msg := ""
 		switch a.state {
@@ -366,41 +310,38 @@ func (a *Agent) Down(ctx context.Context) error {
 		case stateDown:
 			msg = inProgressErrorMessage
 		}
+		a.lock.Unlock()
 		return InvalidStateError(msg)
 	}
 
 	a.state = stateDown
 	a.isDone = false
-	a.progress = make(chan Progress, a.orderedServices.length()+1)
-	go a.exec(ctx)
-	return nil
+	a.progressFn = progressFn
+	a.lock.Unlock()
+
+	return a.exec(ctx)
 }
 
-// report sends the provided message and/or error value on the progress channel.
-// A message is sent if, and only if, the client has called Wait/Progress.
+// report calls the provided progressFn with the given Progress struct.
 func (a *Agent) report(progress Progress) {
-	a.Lock()
-	callee := a.callee
-	a.Unlock()
-
-	if callee != calleeNone {
-		a.progress <- progress
+	if a.progressFn == nil {
+		return
 	}
+	a.progressFn(progress)
 }
 
 // exec runs through the sequence step by step and runs the relevant Service Func.
 // The standard behaviour is to traverse the sequence in chronological order and run the "up" Func. If Agent.state ==
 // downState, the traversal is instead done in reverse order, and the "down" Func will run instead. After each Service
-// has completed, progress is reported on the "progress" channel.
-func (a *Agent) exec(ctx context.Context) {
+// has completed, progressFn is called (if provided) with a Progress struct.
+func (a *Agent) exec(ctx context.Context) error {
 	var err error
 	defer func() {
-		a.Lock()
 		if err == nil {
+			a.lock.Lock()
 			a.isDone = true
+			a.lock.Unlock()
 		}
-		close(a.progress)
-		a.Unlock()
 	}()
 
 	var (
@@ -426,17 +367,17 @@ func (a *Agent) exec(ctx context.Context) {
 			err = ctx.Err()
 			<-done // Wait for execPriority to finish before stopping execution.
 			a.report(Progress{Service: "", Err: err})
-			return
+			return err
 		case err = <-done:
 			if err != nil {
-				return
+				return err
 			}
 			continue
 		}
 	}
 
 	a.report(Progress{Service: "", Err: err})
-	return
+	return err
 }
 
 // execPriority executes all Services with the same priority/order.
